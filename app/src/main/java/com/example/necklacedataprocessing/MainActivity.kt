@@ -36,7 +36,7 @@ import kotlin.concurrent.thread
  * The Pi's address cannot be hardcoded: it is assigned by the phone's DHCP server and
  * the subnet varies by device (10.92.208.x on our test handset, 192.168.43.x on others).
  */
-class MainActivity : AppCompatActivity(), PiDiscovery.Listener {
+class MainActivity : AppCompatActivity(), PiDiscovery.Listener, TtsAudioEncoder.Callback {
 
     companion object {
         private const val TAG = "MainActivity"
@@ -59,6 +59,19 @@ class MainActivity : AppCompatActivity(), PiDiscovery.Listener {
 
     // --- Discovery ---
     private var discovery: PiDiscovery? = null
+
+    // --- Text to speech ---
+    private var ttsEncoder: TtsAudioEncoder? = null
+
+    /**
+     * The text currently being synthesised.
+     *
+     * Sent alongside the audio purely so the Pi's log shows what was spoken —
+     * playback uses the audio only. A single field is sufficient because
+     * synthesis uses QUEUE_FLUSH, so only the latest utterance matters.
+     */
+    @Volatile
+    private var pendingSpeechText: String = ""
 
     /** Address reported by discovery. Null until a Pi is found. */
     @Volatile
@@ -96,13 +109,23 @@ class MainActivity : AppCompatActivity(), PiDiscovery.Listener {
         btnScan.setOnClickListener { startDiscovery() }
         btnConnect.setOnClickListener { connectToPi() }
 
+        // Prepare the speech engine now so it is ready by the time the user types.
+        ttsEncoder = TtsAudioEncoder(this).also { it.initialize() }
+
         btnSendSpeech.setOnClickListener {
             val textToSend = etSpeechInput.text.toString().trim()
-            // Guard clause: only send when there is text AND the socket is alive.
-            if (textToSend.isNotEmpty() && isConnected) {
-                sendSpeechPayload(textToSend)
-                etSpeechInput.text.clear()
+            // Guard clause: only synthesise when there is text AND the socket is alive.
+            if (textToSend.isEmpty()) return@setOnClickListener
+            if (!isConnected) {
+                setStatus("Not connected to the Pi.", StatusColour.ERROR)
+                return@setOnClickListener
             }
+
+            // Synthesis is asynchronous; the result arrives in onEncoded below.
+            setStatus("Synthesising speech...", StatusColour.WORKING)
+            pendingSpeechText = textToSend
+            ttsEncoder?.speak(textToSend, this)
+            etSpeechInput.text.clear()
         }
 
         setStatus("Tap \"Scan for Pi\" to begin.", StatusColour.IDLE)
@@ -112,6 +135,8 @@ class MainActivity : AppCompatActivity(), PiDiscovery.Listener {
         super.onDestroy()
         // Stop discovery and tear down the socket so nothing leaks.
         discovery?.cancel()
+        ttsEncoder?.shutdown()
+        ttsEncoder = null
         shouldBeConnected = false
         isConnected = false
         try {
@@ -259,25 +284,54 @@ class MainActivity : AppCompatActivity(), PiDiscovery.Listener {
         }
     }
 
-    private fun sendSpeechPayload(textMessage: String) {
-        // Separate thread — socket writes can block if the network buffer is full.
+    // -----------------------------------------------------------------------
+    // Speech output (TTS -> PCM -> Pi speaker)
+    // -----------------------------------------------------------------------
+
+    /**
+     * Called on a background thread once synthesis has produced PCM samples.
+     *
+     * The samples are base64-encoded 16-bit little-endian mono, which is exactly
+     * what the Pi's `sounddevice.play()` expects.
+     */
+    override fun onEncoded(audioBase64: String, sampleRate: Int) {
+        sendAudioPayload(audioBase64, sampleRate)
+    }
+
+    override fun onError(reason: String) {
+        setStatus(reason, StatusColour.ERROR)
+    }
+
+    /**
+     * Transmit PCM audio to the Pi for playback on its speaker.
+     *
+     * Runs on its own thread: writing a large base64 payload to the socket can
+     * block if the network buffer is full, which must not happen on the UI thread.
+     */
+    private fun sendAudioPayload(audioBase64: String, sampleRate: Int) {
         thread {
             try {
                 // Safe call: skip entirely if the socket is null (not connected).
                 activeSocket?.let { socket ->
                     val payload = JSONObject().apply {
                         put("type", "speech_output")
-                        put("text", textMessage)
-                        put("audio_data", "") // Placeholder — PCM audio added in the AI phase
-                        put("sample_rate", 16000)
+                        // For the Pi's log only — playback uses the audio. Sending the
+                        // text keeps the Pi's console readable during debugging.
+                        put("text", pendingSpeechText)
+                        put("audio_data", audioBase64)
+                        put("sample_rate", sampleRate)
                     }.toString() + "\n" // Trailing newline required by the Pi's readline()
 
                     val writer = BufferedWriter(OutputStreamWriter(socket.getOutputStream()))
                     writer.write(payload)
                     writer.flush() // Force send immediately instead of buffering
+
+                    Log.d(TAG, "Sent ${audioBase64.length} base64 chars at $sampleRate Hz")
+                    setStatus("Audio sent to the Pi.", StatusColour.OK)
                 }
             } catch (e: Exception) {
                 Log.e(TAG, "Send failed: ${e.message}")
+                setStatus("Could not send audio: ${e.message}", StatusColour.ERROR)
             }
         }
     }
