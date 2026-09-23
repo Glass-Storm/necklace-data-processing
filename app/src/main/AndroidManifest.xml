@@ -16,7 +16,12 @@
         <activity
             android:name=".MainActivity"
             android:exported="true"
-            android:windowSoftInputMode="adjustResize">
+            android:windowSoftInputMode="adjustResize"
+            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden">
+            <!-- configChanges: by default Android destroys and recreates the Activity
+                 on rotation, which would tear down the video socket and its threads.
+                 Declaring these means the system calls onConfigurationChanged()
+                 instead, so the connection survives a rotation. -->
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
 

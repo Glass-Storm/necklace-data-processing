@@ -24,6 +24,33 @@
         android:background="#2A2A2A"
         android:scaleType="fitCenter"/>
 
+    <!-- Discovery controls: shown before a connection is established -->
+    <LinearLayout
+        android:id="@+id/layoutDiscovery"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal"
+        android:layout_marginTop="16dp">
+
+        <Button
+            android:id="@+id/btnScan"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:text="Scan for Pi"
+            android:backgroundTint="#2979FF"/>
+
+        <Button
+            android:id="@+id/btnConnect"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:layout_marginStart="8dp"
+            android:text="Connect"
+            android:enabled="false"
+            android:backgroundTint="#00E676"/>
+    </LinearLayout>
+
     <EditText
         android:id="@+id/etSpeechInput"
         android:layout_width="match_parent"
