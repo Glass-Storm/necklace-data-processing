@@ -24,6 +24,45 @@
         android:background="#2A2A2A"
         android:scaleType="fitCenter"/>
 
+    <!-- Gesture readout: the output of the on-device MediaPipe pipeline -->
+    <LinearLayout
+        android:layout_width="320dp"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal"
+        android:layout_marginTop="8dp"
+        android:gravity="center_vertical">
+
+        <TextView
+            android:id="@+id/tvGesture"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:text="Gesture: —"
+            android:textColor="#00E676"
+            android:textSize="20sp"
+            android:textStyle="bold"/>
+
+        <TextView
+            android:id="@+id/tvFingerPattern"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="-----"
+            android:textColor="#888888"
+            android:textSize="16sp"
+            android:fontFamily="monospace"/>
+    </LinearLayout>
+
+    <!-- Skeleton overlay toggle: verification aid, off by default so the
+         normal view is the raw camera feed. -->
+    <CheckBox
+        android:id="@+id/cbShowSkeleton"
+        android:layout_width="320dp"
+        android:layout_height="wrap_content"
+        android:text="Show hand skeleton overlay"
+        android:textColor="#CCCCCC"
+        android:textSize="13sp"
+        android:layout_marginTop="4dp"/>
+
     <!-- Discovery controls: shown before a connection is established -->
     <LinearLayout
         android:id="@+id/layoutDiscovery"

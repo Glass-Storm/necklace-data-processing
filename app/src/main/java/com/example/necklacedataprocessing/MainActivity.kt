@@ -5,6 +5,7 @@ import android.os.Bundle
 import android.util.Base64
 import android.util.Log
 import android.widget.Button
+import android.widget.CheckBox
 import android.widget.EditText
 import android.widget.ImageView
 import android.widget.TextView
@@ -52,6 +53,9 @@ class MainActivity : AppCompatActivity(), PiDiscovery.Listener, TtsAudioEncoder.
     // --- UI ---
     private lateinit var tvStatus: TextView
     private lateinit var ivNecklaceFeed: ImageView
+    private lateinit var tvGesture: TextView
+    private lateinit var tvFingerPattern: TextView
+    private lateinit var cbShowSkeleton: CheckBox
     private lateinit var etSpeechInput: EditText
     private lateinit var btnSendSpeech: Button
     private lateinit var btnScan: Button
@@ -62,6 +66,28 @@ class MainActivity : AppCompatActivity(), PiDiscovery.Listener, TtsAudioEncoder.
 
     // --- Text to speech ---
     private var ttsEncoder: TtsAudioEncoder? = null
+
+    // --- Hand gesture recognition ---
+    /**
+     * On-device MediaPipe landmarker and classifier.
+     *
+     * Created lazily on the network thread during the first frame, because
+     * construction loads a 7.8 MB model from assets and would visibly stall the
+     * UI if done in onCreate.
+     */
+    @Volatile
+    private var gestureAnalyzer: HandGestureAnalyzer? = null
+
+    /**
+     * The most recent decoded frame, kept only so the skeleton overlay can be
+     * redrawn when the checkbox is toggled without waiting for the next frame.
+     */
+    @Volatile
+    private var lastFrame: android.graphics.Bitmap? = null
+
+    /** The last gesture reported to the UI, to avoid redundant TextView updates. */
+    @Volatile
+    private var lastReportedGesture: String? = null
 
     /**
      * The text currently being synthesised.
@@ -101,10 +127,18 @@ class MainActivity : AppCompatActivity(), PiDiscovery.Listener, TtsAudioEncoder.
 
         tvStatus = findViewById(R.id.tvStatus)
         ivNecklaceFeed = findViewById(R.id.ivNecklaceFeed)
+        tvGesture = findViewById(R.id.tvGesture)
+        tvFingerPattern = findViewById(R.id.tvFingerPattern)
+        cbShowSkeleton = findViewById(R.id.cbShowSkeleton)
         etSpeechInput = findViewById(R.id.etSpeechInput)
         btnSendSpeech = findViewById(R.id.btnSendSpeech)
         btnScan = findViewById(R.id.btnScan)
         btnConnect = findViewById(R.id.btnConnect)
+
+        // Redraw immediately from the retained frame so the toggle feels instant.
+        cbShowSkeleton.setOnCheckedChangeListener { _, _ ->
+            lastFrame?.let { renderFrame(it) }
+        }
 
         btnScan.setOnClickListener { startDiscovery() }
         btnConnect.setOnClickListener { connectToPi() }
@@ -137,6 +171,13 @@ class MainActivity : AppCompatActivity(), PiDiscovery.Listener, TtsAudioEncoder.
         discovery?.cancel()
         ttsEncoder?.shutdown()
         ttsEncoder = null
+
+        // The landmarker holds native memory outside the JVM heap, so it must be
+        // released explicitly rather than left to the garbage collector.
+        gestureAnalyzer?.close()
+        gestureAnalyzer = null
+        lastFrame = null
+
         shouldBeConnected = false
         isConnected = false
         try {
@@ -253,9 +294,14 @@ class MainActivity : AppCompatActivity(), PiDiscovery.Listener, TtsAudioEncoder.
                                 val bitmap = BitmapFactory.decodeByteArray(
                                     decodedBytes, 0, decodedBytes.size,
                                 )
+                                if (bitmap == null) {
+                                    Log.w(TAG, "Frame decoded to null bitmap, skipping")
+                                    continue
+                                }
 
-                                // Render on the UI thread — Bitmaps cannot be drawn off-thread.
-                                runOnUiThread { ivNecklaceFeed.setImageBitmap(bitmap) }
+                                // This is the network thread, so inference is safe here:
+                                // it would freeze the UI if it ran on the main thread.
+                                analyseFrame(bitmap)
                             }
 
                             // Unknown types are ignored so the protocol can be extended
@@ -282,6 +328,97 @@ class MainActivity : AppCompatActivity(), PiDiscovery.Listener, TtsAudioEncoder.
                 }
             }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Speech output (TTS -> PCM -> Pi speaker)
+    // -----------------------------------------------------------------------
+    // -----------------------------------------------------------------------
+    // Hand gesture recognition
+    // -----------------------------------------------------------------------
+
+    /**
+     * Run landmark detection on one frame and publish the result.
+     *
+     * Called on the network thread. The frame is retained before rendering so
+     * the skeleton toggle can redraw without waiting for the next one.
+     *
+     * @param bitmap the decoded frame. Ownership transfers here; it is recycled
+     *   once it has been superseded, since a 10 FPS stream would otherwise
+     *   allocate thousands of bitmaps a minute.
+     */
+    private fun analyseFrame(bitmap: android.graphics.Bitmap) {
+        val analyzer = gestureAnalyzer ?: HandGestureAnalyzer(this).also {
+            gestureAnalyzer = it
+            Log.d(TAG, "Gesture analyzer initialised")
+        }
+
+        val result = try {
+            analyzer.analyze(bitmap)
+        } catch (e: Exception) {
+            // Never let one bad frame tear down the socket loop.
+            Log.e(TAG, "Analysis failed: ${e.message}")
+            null
+        }
+
+        val previous = lastFrame
+        lastFrame = bitmap
+        renderFrame(bitmap)
+        // NOTE: `previous` is deliberately NOT recycled here. The UI thread may
+        // still be drawing it — setImageBitmap is posted, not synchronous — and
+        // recycling under the renderer crashed the app with
+        // "Canvas: trying to use a recycled bitmap" (seen in live testing).
+        // Bitmap pixels live in native heap tracked by the GC on API 26+, and a
+        // 320x240 frame is ~300 KB, so letting go of the reference is enough.
+        @Suppress("UNUSED_VARIABLE")
+        val superseded = previous
+
+        if (result == null) {
+            // No hand in view. Only touch the UI when the label actually changes.
+            if (lastReportedGesture != null) {
+                lastReportedGesture = null
+                runOnUiThread {
+                    tvGesture.text = "Gesture: —"
+                    tvFingerPattern.text = "-----"
+                }
+            }
+            return
+        }
+
+        // The finger pattern is per-frame truth, so it updates every frame.
+        // The name is the stabilised majority; updating it only on change keeps
+        // Logcat readable, and a TextChanged there is the interesting event.
+        val label = result.stableGesture
+        val detail = "${result.handedness} · ${(result.confidence * 100).toInt()}%"
+        runOnUiThread {
+            tvFingerPattern.text = result.fingers.pattern()
+            if (label != lastReportedGesture) {
+                lastReportedGesture = label
+                tvGesture.text = "Gesture: $label"
+                tvGesture.contentDescription = detail
+            }
+        }
+        Log.d(TAG, "Frame pattern=${result.fingers.pattern()} stable=$label $detail")
+    }
+
+    /**
+     * Draw [bitmap] into the feed, optionally with the landmark overlay.
+     *
+     * Marshals onto the UI thread because Bitmaps cannot be drawn off-thread.
+     */
+    private fun renderFrame(bitmap: android.graphics.Bitmap) {
+        val showSkeleton = cbShowSkeleton.isChecked
+        val analyzer = gestureAnalyzer
+
+        val toDraw = if (showSkeleton && analyzer != null) {
+            // drawOverlay returns null when no hand was found, in which case the
+            // plain frame is shown instead of a skeleton-less overlay.
+            analyzer.drawOverlay(bitmap, analyzer.lastLandmarks) ?: bitmap
+        } else {
+            bitmap
+        }
+
+        runOnUiThread { ivNecklaceFeed.setImageBitmap(toDraw) }
     }
 
     // -----------------------------------------------------------------------
