@@ -18,7 +18,7 @@ import kotlin.concurrent.thread
 
 class MainActivity : AppCompatActivity() {
 
-    private val piIpAddress = "10.108.233.5" // Replace with hotspot-assigned Pi IP
+    private val piIpAddress = "10.112.250.7" // Replace with hotspot-assigned Pi IP
     private val piPort = 8765
 
     private lateinit var tvStatus: TextView
