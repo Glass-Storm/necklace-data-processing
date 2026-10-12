@@ -346,6 +346,23 @@ class MainActivity : AppCompatActivity(), PiDiscovery.Listener, TtsAudioEncoder.
                                 processFrameLine(json)
                             }
 
+                            // The Pi is in privacy-crop mode and no hand is in
+                            // view: no image was sent at all. Clear the readout
+                            // so a stale gesture label cannot outlive its frame.
+                            "no_hand" -> {
+                                handleNoHand()
+                            }
+
+                            // Landmarks mode (privacy-max): the Pi ran the
+                            // model and only coordinates crossed the wire —
+                            // no image data ever leaves the wearable. The
+                            // phone's job is geometry + rendering, no
+                            // inference, so this path cannot flicker: the
+                            // skeleton is drawn from exactly what arrived.
+                            "hand_landmarks" -> {
+                                processLandmarksLine(json)
+                            }
+
                             // Unknown types are ignored so the protocol can be extended
                             // without breaking older clients.
                             else -> Unit
@@ -488,6 +505,110 @@ class MainActivity : AppCompatActivity(), PiDiscovery.Listener, TtsAudioEncoder.
     // Speech output (TTS -> PCM -> Pi speaker)
     // -----------------------------------------------------------------------
 
+    /**
+     * Called on a background thread once synthesis has produced PCM samples.
+     */
+    /**
+     * Shared "hand left the frame" handling for both transports.
+     *
+     * Clears the skeleton view and the gesture label, so nothing stale
+     * survives the hand's absence.
+     */
+    private fun handleNoHand() {
+        lastFrame = null
+        if (lastReportedGesture != null) {
+            lastReportedGesture = null
+            runOnUiThread {
+                tvGesture.text = "Gesture: —"
+                tvFingerPattern.text = "-----"
+            }
+        }
+    }
+
+    /**
+     * Classify one `hand_landmarks` payload and render its skeleton.
+     *
+     * Runs on the network thread. Landmarks arrive as a flat 21×3 array,
+     * normalised 0-1, Pi ordering (MediaPipe convention).
+     */
+    private fun processLandmarksLine(json: org.json.JSONObject) {
+        val lmArray = json.optJSONArray("lm") ?: run {
+            Log.w(TAG, "hand_landmarks without lm array, skipping")
+            return
+        }
+        if (lmArray.length() < 63) {
+            Log.w(TAG, "landmark array too short (${lmArray.length()}), skipping")
+            return
+        }
+
+        val points = buildList {
+            for (i in 0 until 21) {
+                add(
+                    HandGestureAnalyzer.LandmarkPoint(
+                        x = lmArray.optDouble(i * 3, Double.NaN).toFloat(),
+                        y = lmArray.optDouble(i * 3 + 1, Double.NaN).toFloat(),
+                        z = lmArray.optDouble(i * 3 + 2, Double.NaN).toFloat(),
+                    )
+                )
+            }
+        }
+
+        val analyzer = gestureAnalyzer ?: HandGestureAnalyzer(this).also {
+            gestureAnalyzer = it
+            Log.d(TAG, "Gesture analyzer initialised (landmarks mode)")
+        }
+
+        val result = try {
+            analyzer.analyzeLandmarks(
+                points,
+                json.optString("hand", "Unknown"),
+            )
+        } catch (e: Exception) {
+            Log.e(TAG, "Landmark analysis failed: ${e.message}")
+            null
+        }
+
+        if (result == null) {
+            handleNoHand()
+            return
+        }
+
+        // Landmarks mode display: the skeleton IS the feed. Drawn from the
+        // received coordinates on a black canvas — no image was transmitted.
+        val skeleton = analyzer.drawSkeletonOnBlack(320, 240, points)
+        runOnUiThread { ivNecklaceFeed.setImageBitmap(skeleton) }
+
+        publishGestureResult(result, analyzer)
+    }
+
+    /**
+     * Shared display path for both transports: the stable label, the finger
+     * pattern, and the detail string.
+     *
+     * Both transports converge here so the display policy is identical no
+     * matter where the landmarks came from. (The speech layer was reverted;
+     * when it returns, its hooks belong in this same function.)
+     */
+    private fun publishGestureResult(
+        result: HandGestureAnalyzer.GestureResult,
+        analyzer: HandGestureAnalyzer,
+    ) {
+        val detail = "${result.handedness} · ${(result.confidence * 100).toInt()}%"
+        val label = result.stableGesture
+        runOnUiThread {
+            tvFingerPattern.text = result.fingers.pattern()
+            if (label != lastReportedGesture) {
+                lastReportedGesture = label
+                tvGesture.text = "Gesture: $label"
+                tvGesture.contentDescription = detail
+            }
+        }
+        Log.d(TAG, "Frame pattern=${result.fingers.pattern()} stable=$label $detail")
+    }
+
+    // -----------------------------------------------------------------------
+    // Speech output (TTS -> PCM -> Pi speaker)
+    // -----------------------------------------------------------------------
     /**
      * Called on a background thread once synthesis has produced PCM samples.
      *

@@ -44,6 +44,16 @@ import kotlin.math.sqrt
  */
 class HandGestureAnalyzer(context: Context) : AutoCloseable {
 
+    /**
+     * One landmark, decoupled from MediaPipe's container type.
+     *
+     * The classifier consumes landmarks from two sources: MediaPipe on-device
+     * (image mode) and the Pi's `hand_landmarks` JSON (landmarks mode, where
+     * the Pi runs the model and only coordinates cross the wire). A plain
+     * triple keeps the geometry independent of both transports.
+     */
+    data class LandmarkPoint(val x: Float, val y: Float, val z: Float)
+
     companion object {
         private const val TAG = "HandGestureAnalyzer"
 
@@ -72,6 +82,16 @@ class HandGestureAnalyzer(context: Context) : AutoCloseable {
         /** Reported while the recent frames disagree, i.e. the gesture is in flux. */
         private const val UNSTABLE = "—"
 
+        /**
+         * A thumb tip closer than this fraction of the palm length to any of
+         * the index/middle/ring knuckles is FOLDED on the palm, regardless of
+         * its joint angle. Fixes the folded-across-palm thumb reading as
+         * extended (caught live: a peace sign with the thumb tucked read
+         * 11100 instead of 01100). Validated against MediaPipe's reference
+         * landmarks in tools/verify_thumb_fix.py.
+         */
+        private const val THUMB_FOLDED_PROXIMITY = 0.5f
+
         /** Landmark indices, named so the geometry below stays readable. */
         private const val WRIST = 0
         private const val THUMB_CMC = 1
@@ -84,8 +104,10 @@ class HandGestureAnalyzer(context: Context) : AutoCloseable {
         private const val MIDDLE_MCP = 9
         private const val MIDDLE_PIP = 10
         private const val MIDDLE_TIP = 12
+        private const val RING_MCP = 13
         private const val RING_PIP = 14
         private const val RING_TIP = 16
+        private const val PINKY_MCP = 17
         private const val PINKY_PIP = 18
         private const val PINKY_TIP = 20
 
@@ -146,6 +168,13 @@ class HandGestureAnalyzer(context: Context) : AutoCloseable {
         val stableGesture: String,
         val isStable: Boolean,
         val fingers: FingerStates,
+        /**
+         * "up"/"down" when the thumb is extended — the thumb tip relative to
+         * the wrist in image coordinates. Null for every other pattern. This
+         * is the orientation dimension of sign: a thumbs-up and thumbs-down
+         * share the handshape 10000 and differ only here.
+         */
+        val orientation: String?,
         val handedness: String,
         val confidence: Float,
     )
@@ -154,6 +183,9 @@ class HandGestureAnalyzer(context: Context) : AutoCloseable {
 
     /** Rolling window of recent raw classifications, for the stability filter. */
     private val recentGestures = ArrayDeque<String>()
+
+    /** Rolling window of recent raw patterns, parallel to [recentGestures]. */
+    private val recentPatterns = ArrayDeque<String>()
 
     private var closed = false
 
@@ -215,6 +247,7 @@ class HandGestureAnalyzer(context: Context) : AutoCloseable {
             // No hand in view. Clear the window so a stale gesture cannot be
             // reported as stable once the hand reappears somewhere else.
             recentGestures.clear()
+            recentPatterns.clear()
             lastLandmarks = null
             return null
         }
@@ -226,28 +259,87 @@ class HandGestureAnalyzer(context: Context) : AutoCloseable {
             return null
         }
 
-        // Retained so the debug overlay can draw the skeleton for this frame.
-        lastLandmarks = landmarks
+        val points = landmarks.map { LandmarkPoint(it.x(), it.y(), it.z()) }
+        val category = result.handedness().firstOrNull()?.firstOrNull()
+        return analysePoints(points, category?.categoryName(), category?.score() ?: 0f)
+    }
 
-        val fingers = readFingers(landmarks)
+    /**
+     * Classify landmarks that arrived already detected — the landmarks wire
+     * mode, where the Pi ran the model and only coordinates crossed the link.
+     *
+     * This is the phone's entire job in landmarks mode: deterministic
+     * geometry, no inference, cannot fail on the receive side.
+     *
+     * @param points exactly 21 landmarks, Pi ordering (MediaPipe convention)
+     * @param handedness the Pi's label, display information only
+     * @param confidence quality score to surface; pass 1f when unknown
+     */
+    fun analyzeLandmarks(
+        points: List<LandmarkPoint>,
+        handedness: String?,
+        confidence: Float = 1f,
+    ): GestureResult? {
+        if (closed) return null
+        if (points.size < 21) {
+            Log.w(TAG, "Expected 21 landmarks, got ${points.size}")
+            lastLandmarks = null
+            return null
+        }
+        return analysePoints(points, handedness ?: "Unknown", confidence)
+    }
+
+    /** Shared classify path for both transports. */
+    private fun analysePoints(
+        points: List<LandmarkPoint>,
+        handedness: String?,
+        confidence: Float,
+    ): GestureResult {
+        // Retained so the skeleton view can draw this frame's hand.
+        lastLandmarks = points
+
+        val fingers = readFingers(points)
         val raw = classify(fingers)
         val stable = stabilise(raw)
+        recentPatterns.addLast(fingers.pattern())
+        while (recentPatterns.size > STABILITY_WINDOW) {
+            recentPatterns.removeFirst()
+        }
 
-        // Handedness is reported for the image as given. MediaPipe's convention
-        // assumes a non-mirrored image, so a front-facing camera would invert
-        // this label — the Pi's webcam is not mirrored, so it is used as-is.
-        val category = result.handedness().firstOrNull()?.firstOrNull()
-        val handedness = category?.categoryName() ?: "Unknown"
-        val confidence = category?.score() ?: 0f
+        // Thumb orientation: only meaningful when the thumb is extended.
+        val orientation = if (fingers.thumb) {
+            if (points[THUMB_TIP].y < points[WRIST].y) "up" else "down"
+        } else {
+            null
+        }
 
         return GestureResult(
             gesture = raw,
             stableGesture = stable,
             isStable = stable == raw && stable != UNSTABLE,
             fingers = fingers,
-            handedness = handedness,
+            orientation = orientation,
+            handedness = handedness ?: "Unknown",
             confidence = confidence,
         )
+    }
+
+    /**
+     * The majority finger pattern over the stability window, with a
+     * stability verdict — the pattern-space twin of [stabilise].
+     *
+     * Speech must key off this, not the per-frame pattern: the display shows
+     * the stable label, so speaking per-frame patterns made the app say a
+     * word the screen did not show (caught live: screen "Peace", speech
+     * "Thank you" during a flicker).
+     *
+     * @return the majority pattern and whether it had enough support.
+     */
+    fun stablePattern(): Pair<String, Boolean> {
+        if (recentPatterns.isEmpty()) return "" to false
+        val winner = recentPatterns.groupingBy { it }.eachCount()
+            .maxByOrNull { it.value } ?: return "" to false
+        return winner.key to (winner.value >= STABILITY_REQUIRED)
     }
 
     // -----------------------------------------------------------------------
@@ -273,14 +365,36 @@ class HandGestureAnalyzer(context: Context) : AutoCloseable {
      * joint the same two gestures read 165.3 and 113.7, a 37 degree gap.
      * All four reference gestures classify correctly with this joint.
      */
-    private fun readFingers(lm: List<NormalizedLandmark>): FingerStates {
+    private fun readFingers(lm: List<LandmarkPoint>): FingerStates {
+        // The thumb needs two tests: the joint angle alone misreads a thumb
+        // folded across the palm as straight, because the fold happens mostly
+        // at the base while the CMC-MCP-IP chain stays extended-looking.
+        val thumbAngle = angleAt(lm[THUMB_CMC], lm[THUMB_MCP], lm[THUMB_IP])
+        val palmLength = distance(lm[WRIST], lm[MIDDLE_MCP])
+        val thumbProximity = minOf(
+            distance(lm[THUMB_TIP], lm[INDEX_MCP]),
+            distance(lm[THUMB_TIP], lm[MIDDLE_MCP]),
+            distance(lm[THUMB_TIP], lm[RING_MCP]),
+        )
+        val thumbFoldedOnPalm = palmLength > 0 &&
+            thumbProximity / palmLength < THUMB_FOLDED_PROXIMITY
+        val thumbExtended = thumbAngle > EXTENDED_ANGLE_DEGREES && !thumbFoldedOnPalm
+
         return FingerStates(
-            thumb = angleAt(lm[THUMB_CMC], lm[THUMB_MCP], lm[THUMB_IP]) > EXTENDED_ANGLE_DEGREES,
+            thumb = thumbExtended,
             index = angleAt(lm[INDEX_MCP], lm[INDEX_PIP], lm[INDEX_TIP]) > EXTENDED_ANGLE_DEGREES,
             middle = angleAt(lm[MIDDLE_MCP], lm[MIDDLE_PIP], lm[MIDDLE_TIP]) > EXTENDED_ANGLE_DEGREES,
-            ring = angleAt(lm[13], lm[RING_PIP], lm[RING_TIP]) > EXTENDED_ANGLE_DEGREES,
-            pinky = angleAt(lm[17], lm[PINKY_PIP], lm[PINKY_TIP]) > EXTENDED_ANGLE_DEGREES,
+            ring = angleAt(lm[RING_MCP], lm[RING_PIP], lm[RING_TIP]) > EXTENDED_ANGLE_DEGREES,
+            pinky = angleAt(lm[PINKY_MCP], lm[PINKY_PIP], lm[PINKY_TIP]) > EXTENDED_ANGLE_DEGREES,
         )
+    }
+
+    /** Euclidean distance between two landmarks in 3D. */
+    private fun distance(a: LandmarkPoint, b: LandmarkPoint): Double {
+        val dx = (a.x - b.x).toDouble()
+        val dy = (a.y - b.y).toDouble()
+        val dz = (a.z - b.z).toDouble()
+        return sqrt(dx * dx + dy * dy + dz * dz)
     }
 
     /**
@@ -300,18 +414,18 @@ class HandGestureAnalyzer(context: Context) : AutoCloseable {
      * back on itself.
      */
     private fun angleAt(
-        a: NormalizedLandmark,
-        b: NormalizedLandmark,
-        c: NormalizedLandmark,
+        a: LandmarkPoint,
+        b: LandmarkPoint,
+        c: LandmarkPoint,
     ): Double {
         // Widened to Double: NormalizedLandmark exposes Float coordinates, but
         // acos() needs Double and the extra precision costs nothing here.
-        val abX = (a.x() - b.x()).toDouble()
-        val abY = (a.y() - b.y()).toDouble()
-        val abZ = (a.z() - b.z()).toDouble()
-        val cbX = (c.x() - b.x()).toDouble()
-        val cbY = (c.y() - b.y()).toDouble()
-        val cbZ = (c.z() - b.z()).toDouble()
+        val abX = (a.x - b.x).toDouble()
+        val abY = (a.y - b.y).toDouble()
+        val abZ = (a.z - b.z).toDouble()
+        val cbX = (c.x - b.x).toDouble()
+        val cbY = (c.y - b.y).toDouble()
+        val cbZ = (c.z - b.z).toDouble()
 
         val magnitudeAB = sqrt(abX * abX + abY * abY + abZ * abZ)
         val magnitudeCB = sqrt(cbX * cbX + cbY * cbY + cbZ * cbZ)
@@ -386,7 +500,7 @@ class HandGestureAnalyzer(context: Context) : AutoCloseable {
      *
      * @return a new bitmap, or null when no hand was detected.
      */
-    fun drawOverlay(source: Bitmap, landmarks: List<NormalizedLandmark>?): Bitmap? {
+    fun drawOverlay(source: Bitmap, landmarks: List<LandmarkPoint>?): Bitmap? {
         if (landmarks == null || landmarks.size < 21) return null
 
         val output = source.copy(Bitmap.Config.ARGB_8888, true)
@@ -407,15 +521,55 @@ class HandGestureAnalyzer(context: Context) : AutoCloseable {
 
         for ((from, to) in HAND_CONNECTIONS) {
             canvas.drawLine(
-                landmarks[from].x() * width, landmarks[from].y() * height,
-                landmarks[to].x() * width, landmarks[to].y() * height,
+                landmarks[from].x * width, landmarks[from].y * height,
+                landmarks[to].x * width, landmarks[to].y * height,
                 bonePaint,
             )
         }
         for (landmark in landmarks) {
-            canvas.drawPoint(landmark.x() * width, landmark.y() * height, jointPaint)
+            canvas.drawPoint(landmark.x * width, landmark.y * height, jointPaint)
         }
 
+        return output
+    }
+
+    /**
+     * Render a skeleton on a plain black canvas — the landmarks-mode display.
+     *
+     * No image ever arrived: the phone draws what the Pi measured. This is
+     * the primary visual feed in landmarks mode, and it cannot flicker,
+     * because it is drawn from exactly the coordinates that were received.
+     */
+    fun drawSkeletonOnBlack(width: Int, height: Int, landmarks: List<LandmarkPoint>?): Bitmap {
+        val output = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+        output.eraseColor(android.graphics.Color.BLACK)
+        if (landmarks == null || landmarks.size < 21) return output
+
+        val canvas = Canvas(output)
+        val w = width.toFloat()
+        val h = height.toFloat()
+
+        val bonePaint = Paint().apply {
+            color = Color.CYAN
+            strokeWidth = 4f
+            isAntiAlias = true
+        }
+        val jointPaint = Paint().apply {
+            color = Color.YELLOW
+            strokeWidth = 8f
+            isAntiAlias = true
+        }
+
+        for ((from, to) in HAND_CONNECTIONS) {
+            canvas.drawLine(
+                landmarks[from].x * w, landmarks[from].y * h,
+                landmarks[to].x * w, landmarks[to].y * h,
+                bonePaint,
+            )
+        }
+        for (landmark in landmarks) {
+            canvas.drawPoint(landmark.x * w, landmark.y * h, jointPaint)
+        }
         return output
     }
 
@@ -425,7 +579,7 @@ class HandGestureAnalyzer(context: Context) : AutoCloseable {
      * Kept separate from [GestureResult] so the classifier's output stays a
      * clean, UI-agnostic data class.
      */
-    var lastLandmarks: List<NormalizedLandmark>? = null
+    var lastLandmarks: List<LandmarkPoint>? = null
         private set
 
     // -----------------------------------------------------------------------
