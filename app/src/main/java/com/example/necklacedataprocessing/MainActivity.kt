@@ -46,6 +46,13 @@ class MainActivity : AppCompatActivity(), PiDiscovery.Listener, TtsAudioEncoder.
         /** Connect/read timeout for the video socket. */
         private const val SOCKET_TIMEOUT_MS = 5000
 
+        /**
+         * Cap on the socket's kernel receive buffer (~10 frames at the Pi's
+         * frame size). See the comment at the call site for why this bounds
+         * worst-case latency.
+         */
+        private const val RECEIVE_BUFFER_BYTES = 128 * 1024
+
         /** Delay before retrying a dropped connection. */
         private const val RECONNECT_DELAY_MS = 3000L
     }
@@ -244,6 +251,23 @@ class MainActivity : AppCompatActivity(), PiDiscovery.Listener, TtsAudioEncoder.
         btnConnect.isEnabled = false
         btnScan.isEnabled = false
 
+        // Warm the analyzer up now, in parallel with the connection. Loading the
+        // 7.8 MB model takes ~400 ms; done lazily on the first frame, that stall
+        // happens while the Pi is already streaming, and the frames queued during
+        // the stall are read afterwards as if they were live — a permanent
+        // +0.5 s of latency from the very first second. Warming up before the
+        // stream starts removes the stall entirely.
+        thread(name = "analyzer-warmup") {
+            try {
+                if (gestureAnalyzer == null && shouldBeConnected) {
+                    gestureAnalyzer = HandGestureAnalyzer(this@MainActivity)
+                    Log.d(TAG, "Gesture analyzer pre-warmed")
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Analyzer warm-up failed: ${e.message}")
+            }
+        }
+
         connectLoop(ip)
     }
 
@@ -260,6 +284,17 @@ class MainActivity : AppCompatActivity(), PiDiscovery.Listener, TtsAudioEncoder.
 
                     // Connect with a timeout so an unreachable Pi fails fast instead of hanging.
                     val socket = Socket()
+                    // Bound the kernel's receive buffer. TCP never discards data, so
+                    // when the Wi-Fi link dips the buffer silently absorbs frames the
+                    // app has not read yet — and every frame in it is already stale.
+                    // A large default (often 1-4 MB on Android) can hold tens of
+                    // frames, i.e. seconds of dead time that never recovers, because
+                    // FIFO delivery means the app must chew through the old frames
+                    // before reaching the live ones. 128 KB holds ~10 frames at the
+                    // Pi's ~12 KB/frame, which caps the worst-case buffer delay while
+                    // still riding out momentary jitter. The drain-to-latest loop
+                    // below is the primary defence; this is the second line.
+                    socket.receiveBufferSize = RECEIVE_BUFFER_BYTES
                     socket.connect(InetSocketAddress(ip, PI_PORT), SOCKET_TIMEOUT_MS)
                     // Without a read timeout, a silently dead Pi would block readLine() forever.
                     socket.soTimeout = SOCKET_TIMEOUT_MS
@@ -275,7 +310,26 @@ class MainActivity : AppCompatActivity(), PiDiscovery.Listener, TtsAudioEncoder.
 
                     while (isConnected && shouldBeConnected) {
                         // Blocks until a full line arrives. Returns null if the Pi closed the stream.
-                        val line = reader.readLine() ?: break
+                        var line = reader.readLine() ?: break
+
+                        // --- Drain to the newest frame ---------------------------------
+                        // If more complete lines are already buffered, this one is
+                        // stale: the link was faster than the processing loop at some
+                        // point, and FIFO delivery means processing every buffered
+                        // frame would replay the past. Jump straight to the newest
+                        // buffered line and skip the rest — they are never decoded or
+                        // analysed, so a multi-second backlog collapses to one frame
+                        // of latency within a single loop iteration.
+                        var skipped = 0
+                        while (reader.ready()) {
+                            val newer = reader.readLine() ?: break
+                            line = newer
+                            skipped++
+                        }
+                        if (skipped > 0) {
+                            Log.d(TAG, "Drained $skipped stale frame(s)")
+                        }
+
                         val json = JSONObject(line)
 
                         when (json.optString("type")) {
@@ -289,19 +343,7 @@ class MainActivity : AppCompatActivity(), PiDiscovery.Listener, TtsAudioEncoder.
 
                             // Reverse the Pi's pipeline: Base64 text -> binary JPEG -> Bitmap.
                             "video_frame" -> {
-                                val imageB64 = json.getString("image")
-                                val decodedBytes = Base64.decode(imageB64, Base64.DEFAULT)
-                                val bitmap = BitmapFactory.decodeByteArray(
-                                    decodedBytes, 0, decodedBytes.size,
-                                )
-                                if (bitmap == null) {
-                                    Log.w(TAG, "Frame decoded to null bitmap, skipping")
-                                    continue
-                                }
-
-                                // This is the network thread, so inference is safe here:
-                                // it would freeze the UI if it ran on the main thread.
-                                analyseFrame(bitmap)
+                                processFrameLine(json)
                             }
 
                             // Unknown types are ignored so the protocol can be extended
@@ -336,6 +378,27 @@ class MainActivity : AppCompatActivity(), PiDiscovery.Listener, TtsAudioEncoder.
     // -----------------------------------------------------------------------
     // Hand gesture recognition
     // -----------------------------------------------------------------------
+
+    /**
+     * Decode one video_frame JSON payload and run it through the analyzer.
+     *
+     * Runs on the network thread. Called at most once per read-loop iteration —
+     * stale frames are drained before this is reached, so this never processes
+     * a frame that is already out of date.
+     */
+    private fun processFrameLine(json: org.json.JSONObject) {
+        val imageB64 = json.getString("image")
+        val decodedBytes = Base64.decode(imageB64, Base64.DEFAULT)
+        val bitmap = BitmapFactory.decodeByteArray(decodedBytes, 0, decodedBytes.size)
+        if (bitmap == null) {
+            Log.w(TAG, "Frame decoded to null bitmap, skipping")
+            return
+        }
+
+        // This is the network thread, so inference is safe here: it would
+        // freeze the UI if it ran on the main thread.
+        analyseFrame(bitmap)
+    }
 
     /**
      * Run landmark detection on one frame and publish the result.
